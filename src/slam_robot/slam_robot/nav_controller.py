@@ -15,11 +15,24 @@ from tf2_ros import Buffer, TransformListener, TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
 import numpy as np
 import math
-import heapq
 import os
 import yaml
 import sys
 from PIL import Image
+
+from slam_robot.navigation_geometry import (
+    astar_grid,
+    is_flank_threat,
+    is_oncoming,
+    is_rear_threat,
+    is_remerge_blocked,
+    lateral_evasion_target,
+    select_evasion_side,
+    sector_distances_from_scan,
+    should_end_evasion,
+    update_closing_speed,
+)
+
 
 class UnifiedNavigatorNode(Node):
     def __init__(self, map_yaml_path):
@@ -190,39 +203,16 @@ class UnifiedNavigatorNode(Node):
             self.get_logger().error(f'❌ Failed to load map from disk: {e}')
 
     def scan_callback(self, msg):
-        front_min = 999.0
-        left_min = 999.0
-        right_min = 999.0
-        rear_min = 999.0
-        angle_min = msg.angle_min
-        angle_inc = msg.angle_increment
-
-        for i, r in enumerate(msg.ranges):
-            if math.isinf(r) or math.isnan(r) or r < msg.range_min:
-                continue
-            angle = angle_min + i * angle_inc
-
-            # Front cone (-35° to +35°)
-            if -0.61 <= angle <= 0.61:
-                if r < front_min:
-                    front_min = r
-            # Left sector (+35° to +110°)
-            elif 0.61 < angle <= 1.92:
-                if r < left_min:
-                    left_min = r
-            # Right sector (-110° to -35°)
-            elif -1.92 <= angle < -0.61:
-                if r < right_min:
-                    right_min = r
-            # Rear sector (|angle| > 2.35 rad, i.e., -180° to -135° and +135° to +180°)
-            elif abs(angle) > 2.35:
-                if r < rear_min:
-                    rear_min = r
-
-        self.front_obstacle_dist = front_min
-        self.left_obstacle_dist = left_min
-        self.right_obstacle_dist = right_min
-        self.rear_obstacle_dist = rear_min
+        sectors = sector_distances_from_scan(
+            msg.ranges,
+            msg.angle_min,
+            msg.angle_increment,
+            range_min=msg.range_min,
+        )
+        self.front_obstacle_dist = sectors.front
+        self.left_obstacle_dist = sectors.left
+        self.right_obstacle_dist = sectors.right
+        self.rear_obstacle_dist = sectors.rear
 
     def odom_callback(self, msg):
         self.robot_x = msg.pose.pose.position.x
@@ -292,67 +282,18 @@ class UnifiedNavigatorNode(Node):
         g_row = max(0, min(self.height - 1, g_row))
         g_col = max(0, min(self.width - 1, g_col))
 
-        self.get_logger().info(f'🔎 Planning path: Start=({start_x:.2f}, {start_y:.2f}) -> Goal=({goal_x:.2f}, {goal_y:.2f})')
+        self.get_logger().info(
+            f'🔎 Planning path: Start=({start_x:.2f}, {start_y:.2f}) -> Goal=({goal_x:.2f}, {goal_y:.2f})'
+        )
 
-        grid = self.map_grid.copy()
-
-        # Clear start and goal cell clearance area (radius 3)
-        for dr in range(-3, 4):
-            for dc in range(-3, 4):
-                sr, sc = s_row+dr, s_col+dc
-                gr, gc = g_row+dr, g_col+dc
-                if 0 <= sr < self.height and 0 <= sc < self.width:
-                    grid[sr, sc] = 0
-                if 0 <= gr < self.height and 0 <= gc < self.width:
-                    grid[gr, gc] = 0
-
-        open_set = []
-        heapq.heappush(open_set, (0.0, (s_row, s_col)))
-        came_from = {}
-        g_score = {(s_row, s_col): 0.0}
-
-        def heuristic(r, c):
-            return math.hypot(r - g_row, c - g_col)
-
-        neighbors = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
-
-        found = False
-        iterations = 0
-        max_iterations = self.width * self.height
-
-        while open_set and iterations < max_iterations:
-            iterations += 1
-            _, current = heapq.heappop(open_set)
-            if current == (g_row, g_col):
-                found = True
-                break
-
-            r, c = current
-            for dr, dc in neighbors:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < self.height and 0 <= nc < self.width:
-                    if grid[nr, nc] == 1:
-                        continue
-                    cost = math.hypot(dr, dc)
-                    tentative = g_score[current] + cost
-                    if (nr, nc) not in g_score or tentative < g_score[(nr, nc)]:
-                        g_score[(nr, nc)] = tentative
-                        heapq.heappush(open_set, (tentative + heuristic(nr, nc), (nr, nc)))
-                        came_from[(nr, nc)] = current
-
-        if not found:
-            self.get_logger().error('❌ A* could not find a valid path! Goal may be inside a wall or unmapped area.')
+        path_cells = astar_grid(self.map_grid, (s_row, s_col), (g_row, g_col), clear_radius=3)
+        if not path_cells:
+            self.get_logger().error(
+                '❌ A* could not find a valid path! Goal may be inside a wall or unmapped area.'
+            )
             return []
 
-        # Reconstruct path
-        path_cells = []
-        curr = (g_row, g_col)
-        while curr in came_from:
-            path_cells.append(curr)
-            curr = came_from[curr]
-        path_cells.reverse()
-
-        # Downsample waypoints (every 4 cells = ~8cm steps)
+        # Downsample waypoints (every 4 cells ≈ resolution-scaled step)
         sub = path_cells[::4]
         if path_cells[-1] not in sub:
             sub.append(path_cells[-1])
@@ -469,121 +410,100 @@ class UnifiedNavigatorNode(Node):
         else:
             u_x, u_y = math.cos(ryaw), math.sin(ryaw)
 
-        # Right normal vector to the path direction
-        n_rx = u_y
-        n_ry = -u_x
-
-        # Track relative obstacle approach speed dD/dt (m/s)
-        if self.last_front_dist is not None:
-            raw_rate = (self.front_obstacle_dist - self.last_front_dist) / 0.05
-            self.obstacle_closing_speed = 0.7 * self.obstacle_closing_speed + 0.3 * raw_rate
-        self.last_front_dist = self.front_obstacle_dist
+        # Track relative obstacle approach speeds dD/dt (m/s)
+        self.obstacle_closing_speed, self.last_front_dist = update_closing_speed(
+            self.last_front_dist, self.front_obstacle_dist, self.obstacle_closing_speed
+        )
+        self.rear_closing_speed, self.last_rear_dist = update_closing_speed(
+            self.last_rear_dist, self.rear_obstacle_dist, self.rear_closing_speed
+        )
+        self.left_closing_speed, self.last_left_dist = update_closing_speed(
+            self.last_left_dist, self.left_obstacle_dist, self.left_closing_speed
+        )
+        self.right_closing_speed, self.last_right_dist = update_closing_speed(
+            self.last_right_dist, self.right_obstacle_dist, self.right_closing_speed
+        )
 
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
         # Target yaw to A* waypoint by default
         target_yaw = math.atan2(dy, dx)
 
-        # DYNAMIC SOCIAL NAVIGATION (Bi-Directional Dual-Flank Evasion & Yield-on-Re-Merge)
-        is_oncoming = (self.front_obstacle_dist < 1.80) and (self.obstacle_closing_speed < -0.08)
+        # DYNAMIC SOCIAL NAVIGATION (goal-aware dual-flank evasion & yield-on-re-merge)
+        oncoming = is_oncoming(self.front_obstacle_dist, self.obstacle_closing_speed)
 
-        if is_oncoming and not self.evading_dynamic_obstacle:
+        if oncoming and not self.evading_dynamic_obstacle:
             self.evading_dynamic_obstacle = True
             self.evasion_start_time = now_sec
             self.evasion_end_time = now_sec + 2.2
-            # Goal-Aware Intelligent Side Selection:
-            # Check if target waypoint is to the LEFT or RIGHT of path direction
-            # cross_prod > 0 -> Goal is on the LEFT, cross_prod <= 0 -> Goal is on the RIGHT
-            cross_prod = u_x * dy - u_y * dx
-            prefer_left = (cross_prod > 0.0) and (self.left_obstacle_dist > 0.45)
-            prefer_right = (cross_prod <= 0.0) and (self.right_obstacle_dist > 0.45)
+            self.evasion_side, side_str = select_evasion_side(
+                u_x, u_y, dx, dy,
+                self.left_obstacle_dist, self.right_obstacle_dist,
+            )
+            self.get_logger().info(
+                f'⚡ Goal-Aware Evasion triggered! Oncoming pedestrian at '
+                f'{self.front_obstacle_dist:.2f}m. Accelerating {side_str}...'
+            )
 
-            if prefer_left:
-                self.evasion_side = -1.0  # Shift left towards goal!
-                side_str = "LEFT (towards goal)"
-            elif prefer_right:
-                self.evasion_side = 1.0   # Shift right towards goal!
-                side_str = "RIGHT (towards goal)"
-            elif self.right_obstacle_dist > 0.40:
-                self.evasion_side = 1.0   # Fallback right
-                side_str = "RIGHT (fallback)"
-            else:
-                self.evasion_side = -1.0  # Fallback left
-                side_str = "LEFT (fallback)"
-
-            self.get_logger().info(f'⚡ Goal-Aware Evasion triggered! Oncoming pedestrian at {self.front_obstacle_dist:.2f}m. Accelerating {side_str}...')
-
-        # If in evasion mode
         if self.evading_dynamic_obstacle:
             time_in_evasion = now_sec - self.evasion_start_time
-
-            # Flank clearance check based on evasion side
             if self.evasion_side > 0:
-                is_flank_clear = (self.left_obstacle_dist >= 1.00)
+                is_flank_clear = self.left_obstacle_dist >= 1.00
             else:
-                is_flank_clear = (self.right_obstacle_dist >= 1.00)
+                is_flank_clear = self.right_obstacle_dist >= 1.00
 
-            is_timer_expired = (now_sec >= self.evasion_end_time)
-            is_wall_danger = (self.front_obstacle_dist < 0.50) or (self.right_obstacle_dist < 0.30) or (self.left_obstacle_dist < 0.30)
-
-            if (time_in_evasion >= 0.8 and is_timer_expired and is_flank_clear) or is_wall_danger:
+            end_evasion, reason = should_end_evasion(
+                time_in_evasion,
+                now_sec >= self.evasion_end_time,
+                is_flank_clear,
+                self.front_obstacle_dist,
+                self.left_obstacle_dist,
+                self.right_obstacle_dist,
+            )
+            if end_evasion:
                 self.evading_dynamic_obstacle = False
-                reason = "Wall hazard" if is_wall_danger else "Flank clear"
-                self.get_logger().info(f'✅ Evasion completed ({reason})! Merging back onto A* path at waypoint {self.current_idx + 1}/{len(self.path_points)}')
+                self.get_logger().info(
+                    f'✅ Evasion completed ({reason})! Merging back onto A* path at '
+                    f'waypoint {self.current_idx + 1}/{len(self.path_points)}'
+                )
             else:
-                # Calculate safe lateral offset bounded by wall distance
-                if self.evasion_side > 0:
-                    safe_offset = min(0.35, max(0.15, self.right_obstacle_dist - 0.40))
-                    evade_x = rx + 0.80 * u_x + safe_offset * n_rx
-                    evade_y = ry + 0.80 * u_y + safe_offset * n_ry
-                else:
-                    safe_offset = min(0.35, max(0.15, self.left_obstacle_dist - 0.40))
-                    evade_x = rx + 0.80 * u_x - safe_offset * n_rx
-                    evade_y = ry + 0.80 * u_y - safe_offset * n_ry
+                evade_x, evade_y = lateral_evasion_target(
+                    rx, ry, u_x, u_y, self.evasion_side,
+                    self.left_obstacle_dist, self.right_obstacle_dist,
+                )
                 target_yaw = math.atan2(evade_y - ry, evade_x - rx)
 
         yaw_err = math.atan2(math.sin(target_yaw - ryaw), math.cos(target_yaw - ryaw))
 
-        # Track relative rear & flank obstacle approach speeds (m/s)
-        if self.last_rear_dist is not None:
-            raw_rear_rate = (self.rear_obstacle_dist - self.last_rear_dist) / 0.05
-            self.rear_closing_speed = 0.7 * self.rear_closing_speed + 0.3 * raw_rear_rate
-        self.last_rear_dist = self.rear_obstacle_dist
-
-        if self.last_left_dist is not None:
-            raw_left_rate = (self.left_obstacle_dist - self.last_left_dist) / 0.05
-            self.left_closing_speed = 0.7 * self.left_closing_speed + 0.3 * raw_left_rate
-        self.last_left_dist = self.left_obstacle_dist
-
-        if self.last_right_dist is not None:
-            raw_right_rate = (self.right_obstacle_dist - self.last_right_dist) / 0.05
-            self.right_closing_speed = 0.7 * self.right_closing_speed + 0.3 * raw_right_rate
-        self.last_right_dist = self.right_obstacle_dist
-
-        # REAR THREAT ESCAPE SYSTEM (Trigger ONLY if pedestrian is actively closing in from behind < 0.75m)
-        is_rear_threat = (self.rear_obstacle_dist < 0.75) and (self.rear_closing_speed < -0.08)
-
-        # PERPENDICULAR FLANK THREAT ESCAPE (Trigger if pedestrian approaches from left/right < 0.70m and is closing in)
-        is_flank_threat = ((self.left_obstacle_dist < 0.70 and self.left_closing_speed < -0.08) or
-                           (self.right_obstacle_dist < 0.70 and self.right_closing_speed < -0.08))
-
-        # RE-MERGING YIELD CHECK: If pedestrian is standing/walking in the re-merge path ahead (< 0.85m), STOP & YIELD
-        is_remerge_blocked = (not self.evading_dynamic_obstacle) and (self.front_obstacle_dist < 0.85 or self.left_obstacle_dist < 0.65) and (dist > 0.40)
+        rear_threat = is_rear_threat(self.rear_obstacle_dist, self.rear_closing_speed)
+        flank_threat = is_flank_threat(
+            self.left_obstacle_dist, self.left_closing_speed,
+            self.right_obstacle_dist, self.right_closing_speed,
+        )
+        remerge_blocked = is_remerge_blocked(
+            self.evading_dynamic_obstacle,
+            self.front_obstacle_dist,
+            self.left_obstacle_dist,
+            dist,
+        )
 
         cmd = Twist()
         if self.evading_dynamic_obstacle:
-            # Drive forward in safe evasive lane at 0.35 m/s with responsive steering
             cmd.linear.x = 0.35
             cmd.angular.z = max(min(1.8 * yaw_err, 1.2), -1.2)
-        elif (is_rear_threat or is_flank_threat) and self.front_obstacle_dist > 0.60:
-            # Accelerate forward to 0.42 m/s to clear perpendicular intersection or escape rear pursuer
-            threat_type = "Perpendicular Flank" if is_flank_threat else "Rear"
-            self.get_logger().info(f'⚡ {threat_type} threat detected! Accelerating forward (0.42 m/s) to clear collision zone...')
+        elif (rear_threat or flank_threat) and self.front_obstacle_dist > 0.60:
+            threat_type = "Perpendicular Flank" if flank_threat else "Rear"
+            self.get_logger().info(
+                f'⚡ {threat_type} threat detected! Accelerating forward (0.42 m/s) '
+                f'to clear collision zone...'
+            )
             cmd.linear.x = 0.42
             cmd.angular.z = max(min(1.0 * yaw_err, 0.5), -0.5)
-        elif is_remerge_blocked:
-            # Stop and yield right-of-way cleanly until pedestrian clears the re-merge corridor (Zero spin loop!)
-            self.get_logger().warning(f'🛑 Pedestrian blocking re-merge corridor ({self.front_obstacle_dist:.2f}m). Stopping & yielding...')
+        elif remerge_blocked:
+            self.get_logger().warning(
+                f'🛑 Pedestrian blocking re-merge corridor '
+                f'({self.front_obstacle_dist:.2f}m). Stopping & yielding...'
+            )
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
         else:

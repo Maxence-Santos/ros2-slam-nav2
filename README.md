@@ -12,7 +12,7 @@ An autonomous mobile robot (AGV) project built with **ROS 2** and **Gazebo Sim**
 ## 🌟 Key Capabilities
 
 - **Clean SLAM Exploration**: Dynamic actor-free static warehouse mapping (`warehouse_static.sdf`) with `slam_toolbox` native service map export (`python3 save_map.py`).
-- **Real-Time A* Pathfinder & Wall Inflation**: 0.45m wall safety inflation grid preserving 119,000+ navigable cells without eating unknown exploration spaces.
+- **Real-Time A* Pathfinder & Wall Inflation**: 0.45 m wall safety inflation on the occupancy grid (~56k navigable cells at 2 cm resolution after inflation).
 - **ISO 3691-4 Rule of the Right Evasion**: Proactive dynamic obstacle evasion shifting to a $65\text{ cm}$ parallel lane at accelerated speeds ($0.35\text{ m/s}$).
 - **Goal-Aware Intelligent Side Selection**: Dynamic cross-product vector analysis ($\mathbf{u} \times \mathbf{d}$) choosing left vs. right evasion based on target goal position and lateral clearance.
 - **360° Threat Detection & Multi-Sector Escape**: Real-time LiDAR tracking across 4 sectors (front, left, right, rear) with active rate-of-change derivatives ($\dot{D} < -0.08\text{ m/s}$), triggering forward escape accelerations ($0.42\text{ m/s}$) to outrun rear-end pursuers and clear perpendicular flank collisions.
@@ -102,6 +102,24 @@ In high-reliability robotics engineering, real-world deployment reveals complex 
 
 ---
 
+## 📊 System Metrics (warehouse map)
+
+| Metric | Value |
+|--------|------:|
+| Map size | 376 × 416 cells |
+| Resolution | 2.0 cm / cell |
+| Wall inflation (A*) | 0.45 m |
+| Navigable cells (post-inflation) | ~56 415 |
+| Cruise / evasion / escape speeds | 0.25 / 0.35 / 0.42 m/s |
+| Oncoming trigger | front < 1.80 m and \(\dot{D} < -0.08\) m/s |
+| Rear / flank threat | < 0.75 m / < 0.70 m + closing rate |
+| Emergency stop | front < 0.20 m |
+| Unit tests (pure geometry) | 18 passing (`python3 tests/test_navigation_geometry.py`) |
+
+Core threat / A* / side-selection logic lives in `slam_robot/navigation_geometry.py` (ROS-free, unit-tested).
+
+---
+
 ## 🚀 Quick Start Guide
 
 ### Prerequisites & Dependencies
@@ -112,6 +130,24 @@ In high-reliability robotics engineering, real-world deployment reveals complex 
   sudo apt update
   sudo apt install ros-lyrical-desktop ros-lyrical-ros-gz ros-lyrical-slam-toolbox ros-lyrical-tf2-ros python3-pil python3-numpy
   ```
+
+### Unit tests (no simulation required)
+
+```bash
+cd ~/Documents/robotics-portfolio/ros2-slam-nav2
+python3 tests/test_navigation_geometry.py -v
+```
+
+### Docker (build + unit tests)
+
+Gazebo + RViz demos need a local GPU/display stack — run them on the **host** with the scripts below.  
+Docker is provided for **reproducible build & unit tests** (CI-friendly):
+
+```bash
+cd ~/Documents/robotics-portfolio/ros2-slam-nav2
+docker build -t ros2-slam-nav2:test .
+docker run --rm ros2-slam-nav2:test
+```
 
 ### Phase 1: Static Exploration & Clean Map Export (SLAM)
 Launch the clean static warehouse simulation (no characters) and build the map using keyboard teleop:
@@ -150,25 +186,36 @@ ros2-slam-nav2/
 ├── start_slam_demo.sh         # One-click SLAM exploration launcher (static world)
 ├── start_nav_demo.sh          # One-click Autonomous Navigation launcher (dynamic actors)
 ├── save_map.py                # Graph-aligned map exporter via slam_toolbox native service
+├── Dockerfile                 # Build + unit-test image (no GUI)
+├── tests/
+│   └── test_navigation_geometry.py
+├── media/                     # Demo GIF/video (see media/README.md)
 ├── src/slam_robot/
 │   ├── launch/
 │   │   ├── sim.launch.py      # Main simulation launch (world_type: static vs dynamic)
 │   │   └── slam.launch.py     # slam_toolbox lifecycle node configuration
 │   ├── slam_robot/
-│   │   ├── nav_controller.py  # Unified Navigator, A* Pathfinder & ISO 3691-4 Evasion Controller
+│   │   ├── nav_controller.py  # Unified Navigator (ROS node)
+│   │   ├── navigation_geometry.py  # Pure A* / threat / evasion math (unit-tested)
 │   │   └── dynamic_actors.py  # Gazebo velocity controller for dynamic walking characters
 │   ├── urdf/
-│   │   ├── robot.urdf.xacro   # Main URDF entrypoint
-│   │   └── robot_core.xacro  # Physical dimensions, inertia & Gazebo OdometryPublisher plugin
 │   ├── worlds/
-│   │   ├── warehouse.sdf        # Dynamic warehouse world with 3 walking characters
-│   │   └── warehouse_static.sdf # Static warehouse world for clean SLAM mapping
-│   ├── maps/                  # Generated OccupancyGrid YAML and PGM files
+│   ├── maps/
 │   └── rviz/
-│       └── slam_nav.rviz      # Tuned RViz2 configuration (Map, Path, Scan, SLAM Graph Markers)
-├── LICENSE                    # MIT License
-└── README.md                  # Project documentation & engineering post-mortem
+├── LICENSE
+└── README.md
 ```
+
+---
+
+## 🎬 Demo media
+
+Place a short screen capture in `media/demo.gif` (or `demo.mp4`) showing:
+
+1. SLAM exploration in the static warehouse, then  
+2. Autonomous navigation with pedestrian evasion in RViz + Gazebo.
+
+Capture tips are in [`media/README.md`](media/README.md). Until the file is added, run the live demos with the scripts above.
 
 ---
 
