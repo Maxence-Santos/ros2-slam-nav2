@@ -210,7 +210,13 @@ ros2-slam-nav2/
 
 ## 🎬 Demo video
 
-Three captures of the live navigation demo.
+A SLAM exploration, then two navigation runs.
+
+### SLAM exploration
+
+https://github.com/user-attachments/assets/038c02de-3b8b-4318-b7e4-7b69457178e5
+
+The robot drives through the warehouse while slam_toolbox builds the occupancy map. RViz shows that map filling in beside the Gazebo view.
 
 ### Avoidance of a pedestrian
 
@@ -223,12 +229,6 @@ The robot drives toward the red pedestrian, shifts aside, and passes them. The g
 https://github.com/user-attachments/assets/bf166473-2055-4a96-8a43-b49832f2cf97
 
 The robot follows the planned path through the narrow passage between the lower shelf and the wall, and comes out on the far side of that shelf.
-
-### Path around the shelf
-
-https://github.com/user-attachments/assets/f499e8c6-1af6-4f03-96d3-99f204e22ad5
-
-The robot follows the planned path around the corner of the shelf and along its face, without leaving the path for a wide swing.
 
 ---
 
