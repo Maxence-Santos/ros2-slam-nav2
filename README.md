@@ -208,14 +208,27 @@ ros2-slam-nav2/
 
 ---
 
-## 🎬 Demo media
+## 🎬 Demo video
 
-Place a short screen capture in `media/demo.gif` (or `demo.mp4`) showing:
+Three captures of the live navigation demo.
 
-1. SLAM exploration in the static warehouse, then  
-2. Autonomous navigation with pedestrian evasion in RViz + Gazebo.
+### Avoidance of a pedestrian
 
-Capture tips are in [`media/README.md`](media/README.md). Until the file is added, run the live demos with the scripts above.
+https://github.com/user-attachments/assets/9f198019-58da-4c97-910d-558de3157c3f
+
+The robot drives toward the red pedestrian, shifts aside, and passes them. The green and blue pedestrians stay on their own lanes.
+
+### Path through the lower corridor
+
+https://github.com/user-attachments/assets/bf166473-2055-4a96-8a43-b49832f2cf97
+
+The robot follows the planned path through the narrow passage between the lower shelf and the wall, and comes out on the far side of that shelf.
+
+### Path around the shelf
+
+https://github.com/user-attachments/assets/f499e8c6-1af6-4f03-96d3-99f204e22ad5
+
+The robot follows the planned path around the corner of the shelf and along its face, without leaving the path for a wide swing.
 
 ---
 
